@@ -159,12 +159,28 @@ printf(char *fmt, ...)
   return 0;
 }
 
+
+void       
+backtrace(void){
+  // 读取当前Frame Pointer
+  uint64 fp = r_fp();
+  while(PGROUNDUP(fp) - PGROUNDDOWN(fp) == PGSIZE){
+    // 返回地址保存在-8偏移的位置
+    uint64 ret_addr = *(uint64*)(fp-8);
+    printf("0x%lx\n",ret_addr);
+    // 前一个帧指针保存在-16偏移的位置
+    fp = *(uint64*)(fp-16);
+  }
+}
+
+
 void
 panic(char *s)
 {
   pr.locking = 0;
   printf("panic: ");
   printf("%s\n", s);
+  backtrace();// 新添加
   panicked = 1; // freeze uart output from other CPUs
   for(;;)
     ;
