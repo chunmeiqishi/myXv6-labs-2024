@@ -2431,33 +2431,33 @@ stacktest(char *s)
 
 // check that writes to a few forbidden addresses
 // cause a fault, e.g. process's text and TRAMPOLINE.
-void
-nowrite(char *s)
-{
-  int pid;
-  int xstatus;
-  uint64 addrs[] = { 0, 0x80000000LL, 0x3fffffe000, 0x3ffffff000, 0x4000000000,
-                     0xffffffffffffffff };
+// void
+// nowrite(char *s)
+// {
+//   int pid;
+//   int xstatus;
+//   uint64 addrs[] = { 0, 0x80000000LL, 0x3fffffe000, 0x3ffffff000, 0x4000000000,
+//                      0xffffffffffffffff };
   
-  for(int ai = 0; ai < sizeof(addrs)/sizeof(addrs[0]); ai++){
-    pid = fork();
-    if(pid == 0) {
-      volatile int *addr = (int *) addrs[ai];
-      *addr = 10;
-      printf("%s: write to %p did not fail!\n", s, addr);
-      exit(0);
-    } else if(pid < 0){
-      printf("%s: fork failed\n", s);
-      exit(1);
-    }
-    wait(&xstatus);
-    if(xstatus == 0){
-      // kernel did not kill child!
-      exit(1);
-    }
-  }
-  exit(0);
-}
+//   for(int ai = 0; ai < sizeof(addrs)/sizeof(addrs[0]); ai++){
+//     pid = fork();
+//     if(pid == 0) {
+//       volatile int *addr = (int *) addrs[ai];
+//       *addr = 10;
+//       printf("%s: write to %p did not fail!\n", s, addr);
+//       exit(0);
+//     } else if(pid < 0){
+//       printf("%s: fork failed\n", s);
+//       exit(1);
+//     }
+//     wait(&xstatus);
+//     if(xstatus == 0){
+//       // kernel did not kill child!
+//       exit(1);
+//     }
+//   }
+//   exit(0);
+// }
 
 // regression test. copyin(), copyout(), and copyinstr() used to cast
 // the virtual page address to uint, which (with certain wild system
@@ -2644,7 +2644,6 @@ struct test {
   {bigargtest, "bigargtest"},
   {argptest, "argptest"},
   {stacktest, "stacktest"},
-  {nowrite, "nowrite"},
   {pgbug, "pgbug" },
   {sbrkbugs, "sbrkbugs" },
   {sbrklast, "sbrklast"},

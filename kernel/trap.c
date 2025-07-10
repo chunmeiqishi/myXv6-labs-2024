@@ -72,12 +72,14 @@ usertrap(void)
     if (fault_va >= MAXVA ||
         (fault_va < p->trapframe->sp &&
          fault_va >= (p->trapframe->sp - PGSIZE)) ||
-        fault_va <= 0) {
-      p->killed = 1;
+        fault_va <= 0 
+        || (fault_va >= TRAPFRAME && fault_va < TRAPFRAME + PGSIZE)
+        ||(fault_va >= TRAMPOLINE && fault_va < TRAPFRAME)) {
+      setkilled(p);
     }
     // 尝试进行cow操作
     if (cow_alloc(p->pagetable, PGROUNDDOWN(fault_va)) < 0) {
-      p->killed = 1;
+      setkilled(p);
     }
   } else if((which_dev = devintr()) != 0){
     // ok
