@@ -23,10 +23,20 @@ struct {
   struct run *freelist;
 } kmem;
 
+struct {
+  struct spinlock lock; // 保证操作的原子性
+  int ref_count[(PGROUNDUP(PHYSTOP)) / PGSIZE]; // KERNBASE～PHYSTOP是物理内存的大小，因为xv6的内核地址采用了直接映射，为了方便，这里直接使用PHYSTOP。PHYSTOP / PGSIZE则表示有多少个物理页
+} kref;
+
 void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
+  initlock(&kmem.lock, "kref");
+  // 这里初始化时置为1是为了接下来的freerange在调用kfree时不会触发panic
+  for (int i = 0; i < PGROUNDUP(PHYSTOP) / PGSIZE; i++) {
+    kref.ref_count[i] = 1;
+  }
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -50,6 +60,19 @@ kfree(void *pa)
 
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
+
+
+  // 如果在还未对ref count操作前其值已经小于等于0，说明已有问题
+  if (kref.ref_count[(uint64)pa / PGSIZE] <= 0) {
+    panic("kref");
+  }
+
+  // 每次free一个page时，先将这个page的引用计数-1
+  kref_dec(pa);
+  // ref count - 1，如果结果还大于0，说明这个物理页还被其他进程引用，暂时不需要释放
+  if (kref.ref_count[(uint64)pa / PGSIZE] > 0) {
+    return;
+  }
 
   // Fill with junk to catch dangling refs.
   memset(pa, 1, PGSIZE);
@@ -76,7 +99,62 @@ kalloc(void)
     kmem.freelist = r->next;
   release(&kmem.lock);
 
-  if(r)
+  if(r){
     memset((char*)r, 5, PGSIZE); // fill with junk
+    // 这里赋值为1一定要在设置垃圾数值之后，否则会造成污染
+    acquire(&kref.lock);
+    kref.ref_count[(uint64)r / PGSIZE] = 1;
+    release(&kref.lock);
+  }
   return (void*)r;
+}
+
+// 当出现page fault时，进行cow操作
+int cow_alloc(pagetable_t pagetable, uint64 va) {
+  if (va >= MAXVA) {
+    return -1;
+  }
+
+  if ((va % PGSIZE) != 0) {
+    return -1;
+  }
+
+  pte_t *pte = walk(pagetable, va, 0);
+  if (pte == 0)
+    return -1;
+
+  uint64 pa = PTE2PA(*pte);
+  if (pa == 0)
+    return -1;
+
+  // 当page的cow标志位有效时才会重新分配内存
+  if ((*pte & PTE_COW) && (*pte & PTE_V)) {
+    char* mem = kalloc();
+    if (mem == 0) {
+      return -1;
+    }
+    uint64 flags = PTE_FLAGS(*pte);
+    flags = (flags & ~PTE_COW) | PTE_W; // 去除COW标记，加上写权限标记
+    memmove(mem, (char *)pa, PGSIZE);
+    uvmunmap(pagetable, PGROUNDDOWN(va), 1, 1); // 解除之前的映射，并设置do_free为1，这样在kfree中可来将引用计数-1
+    if (mappages(pagetable, va, PGSIZE, (uint64)mem, flags) < 0) {
+      panic("cow_alloc");
+    }
+  }
+  return 0;
+}
+
+//将引用计数的操作封装一下：
+// 为pa所在的page的引用+1
+void kref_inc(void* pa) {
+  acquire(&kref.lock);
+  ++kref.ref_count[(uint64)pa / PGSIZE];
+  release(&kref.lock);
+}
+
+// 为pa所在的page的引用-1
+void kref_dec(void* pa) {
+  acquire(&kref.lock);
+  --kref.ref_count[(uint64)pa / PGSIZE];
+  release(&kref.lock);
 }

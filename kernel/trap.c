@@ -65,6 +65,20 @@ usertrap(void)
     intr_on();
 
     syscall();
+  } else if (r_scause() == 13 || r_scause() == 15) {
+    // 这里的stval寄存器，我的理解是保存了触发page fault时的虚拟地址
+    uint64 fault_va = r_stval();
+    // 判断地址是否不合法
+    if (fault_va >= MAXVA ||
+        (fault_va < p->trapframe->sp &&
+         fault_va >= (p->trapframe->sp - PGSIZE)) ||
+        fault_va <= 0) {
+      p->killed = 1;
+    }
+    // 尝试进行cow操作
+    if (cow_alloc(p->pagetable, PGROUNDDOWN(fault_va)) < 0) {
+      p->killed = 1;
+    }
   } else if((which_dev = devintr()) != 0){
     // ok
   } else {
