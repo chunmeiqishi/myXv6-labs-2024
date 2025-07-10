@@ -94,28 +94,89 @@ e1000_init(uint32 *xregs)
 int
 e1000_transmit(char *buf, int len)
 {
-  //
-  // Your code here.
-  //
-  // buf contains an ethernet frame; program it into
-  // the TX descriptor ring so that the e1000 sends it. Stash
-  // a pointer so that it can be freed after send completes.
-  //
-
+  acquire(&e1000_lock);
   
+  // 获取 TX 环形缓冲区中下一个要使用的描述符索引
+  uint32 index = regs[E1000_TDT];
+  
+  // 检查描述符是否可用 (Descriptor Done 位已设置表示可用)
+  if(!(tx_ring[index].status & E1000_TXD_STAT_DD)) {
+    release(&e1000_lock);
+    return -1;  // 描述符未完成上一次传输，无法使用
+  }
+  
+  // 释放上一次使用的缓冲区（如果有）
+  if(tx_bufs[index]) {
+    kfree(tx_bufs[index]);
+  }
+  
+  // 保存缓冲区指针，以便后续在传输完成后释放
+  tx_bufs[index] = buf;
+  
+  // 设置描述符字段
+  tx_ring[index].addr = (uint64)buf;
+  tx_ring[index].length = len;
+  
+  // 设置命令标志
+  tx_ring[index].cso = 0;
+  tx_ring[index].cmd = E1000_TXD_CMD_EOP | E1000_TXD_CMD_RS;
+  tx_ring[index].status = 0;
+  tx_ring[index].css = 0;
+  tx_ring[index].special = 0;
+  
+  __sync_synchronize(); // 内存屏障，确保所有写入操作完成
+  
+  // 更新 TDT 寄存器，通知 E1000 有新的数据包要发送
+  regs[E1000_TDT] = (index + 1) % TX_RING_SIZE;
+  
+  release(&e1000_lock);
   return 0;
 }
 
 static void
 e1000_recv(void)
 {
-  //
-  // Your code here.
-  //
-  // Check for packets that have arrived from the e1000
-  // Create and deliver a buf for each packet (using net_rx()).
-  //
-
+  // 循环处理所有已接收的数据包
+  for(;;) {
+    // 计算下一个要检查的接收描述符的索引
+    uint32 index = (regs[E1000_RDT] + 1) % RX_RING_SIZE;
+    
+    // 检查描述符是否有有效数据包 (DD 位表示描述符已被网卡填充)
+    if(!(rx_ring[index].status & E1000_RXD_STAT_DD)) {
+      // 没有更多数据包了
+      break;
+    }
+    
+    // 检查是否是完整的数据包 (EOP 位表示包的结尾)
+    if(!(rx_ring[index].status & E1000_RXD_STAT_EOP)) {
+      panic("e1000_recv: packet too large");
+    }
+    
+    // 获取数据包和长度
+    char *buf = rx_bufs[index];
+    int length = rx_ring[index].length;
+    
+    // 分配新的缓冲区来替换当前的缓冲区
+    char *new_buf = kalloc();
+    if(!new_buf) {
+      panic("e1000_recv: kalloc failed");
+    }
+    
+    // 更新缓冲区数组和描述符
+    rx_bufs[index] = new_buf;
+    rx_ring[index].addr = (uint64)new_buf;
+    
+    // 清除描述符状态，准备接收新的数据包
+    rx_ring[index].status = 0;
+    
+    __sync_synchronize(); // 内存屏障，确保所有写入操作完成
+    
+    // 更新 RDT 寄存器，告诉网卡我们已经处理了这个描述符
+    regs[E1000_RDT] = index;
+    
+    // 将数据包传递给网络栈处理
+    net_rx(buf, length);
+  }
 }
 
 void
