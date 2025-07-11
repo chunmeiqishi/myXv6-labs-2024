@@ -23,32 +23,56 @@
 #include "fs.h"
 #include "buf.h"
 
-struct {
-  struct spinlock lock;
-  struct buf buf[NBUF];
+#define NBUCKETS 13  // 使用质数以减少哈希冲突
 
-  // Linked list of all buffers, through prev/next.
-  // Sorted by how recently the buffer was used.
-  // head.next is most recent, head.prev is least.
-  struct buf head;
+struct {
+  struct buf buf[NBUF]; // 所有的缓冲区
+  struct spinlock lock; // 用于分配新缓冲区的全局锁
 } bcache;
+
+// 哈希桶结构
+struct bucket {
+  struct spinlock lock;       // 每个桶的锁
+  struct buf head;           // 桶中缓冲区的链表头
+} bcache_buckets[NBUCKETS];
+
+// 计算哈希值的辅助函数
+static uint
+hash(uint dev, uint blockno)
+{
+  return blockno % NBUCKETS;
+}
+
 
 void
 binit(void)
 {
   struct buf *b;
+  char lockname[16];
 
+  // 初始化全局锁
   initlock(&bcache.lock, "bcache");
 
-  // Create linked list of buffers
-  bcache.head.prev = &bcache.head;
-  bcache.head.next = &bcache.head;
-  for(b = bcache.buf; b < bcache.buf+NBUF; b++){
-    b->next = bcache.head.next;
-    b->prev = &bcache.head;
+  // 初始化每个桶的锁和链表
+  for(int i = 0; i < NBUCKETS; i++) {
+    snprintf(lockname, sizeof(lockname), "bcache%d", i);
+    initlock(&bcache_buckets[i].lock, lockname);
+    
+    // 初始化桶的头节点
+    bcache_buckets[i].head.prev = &bcache_buckets[i].head;
+    bcache_buckets[i].head.next = &bcache_buckets[i].head;
+  }
+
+  // 初始化所有缓冲区
+  for(b = bcache.buf; b < bcache.buf + NBUF; b++) {
+    b->refcnt = 0;
+    
+    // 将所有缓冲区放入第一个桶中（后续会根据需要移动）
+    b->next = bcache_buckets[0].head.next;
+    b->prev = &bcache_buckets[0].head;
     initsleeplock(&b->lock, "buffer");
-    bcache.head.next->prev = b;
-    bcache.head.next = b;
+    bcache_buckets[0].head.next->prev = b;
+    bcache_buckets[0].head.next = b;
   }
 }
 
@@ -59,33 +83,140 @@ static struct buf*
 bget(uint dev, uint blockno)
 {
   struct buf *b;
-
-  acquire(&bcache.lock);
-
-  // Is the block already cached?
-  for(b = bcache.head.next; b != &bcache.head; b = b->next){
-    if(b->dev == dev && b->blockno == blockno){
+  uint bucket_idx = hash(dev, blockno);
+  struct bucket *bucket = &bcache_buckets[bucket_idx];
+  
+  // 尝试在对应的哈希桶中查找块
+  acquire(&bucket->lock);
+  for(b = bucket->head.next; b != &bucket->head; b = b->next) {
+    if(b->dev == dev && b->blockno == blockno) {
       b->refcnt++;
-      release(&bcache.lock);
+      release(&bucket->lock);
       acquiresleep(&b->lock);
       return b;
     }
   }
+  release(&bucket->lock);
 
-  // Not cached.
-  // Recycle the least recently used (LRU) unused buffer.
-  for(b = bcache.head.prev; b != &bcache.head; b = b->prev){
-    if(b->refcnt == 0) {
-      b->dev = dev;
-      b->blockno = blockno;
-      b->valid = 0;
-      b->refcnt = 1;
+  // 如果没有找到，需要分配一个新的缓冲区
+  // 获取全局锁，确保分配过程的原子性
+  acquire(&bcache.lock);
+  
+  // 再次检查是否存在缓冲区（在获取全局锁期间可能已经被其他进程分配）
+  acquire(&bucket->lock);
+  for(b = bucket->head.next; b != &bucket->head; b = b->next) {
+    if(b->dev == dev && b->blockno == blockno) {
+      b->refcnt++;
+      release(&bucket->lock);
       release(&bcache.lock);
       acquiresleep(&b->lock);
       return b;
     }
   }
-  panic("bget: no buffers");
+  
+  // 仍然没有找到，尝试查找未使用的缓冲区
+  struct buf *best_buf = 0;
+  struct bucket *best_bucket = 0;
+  int best_bucket_idx = 0;
+  
+  // 在所有桶中查找引用计数为0的缓冲区
+  for(int i = 0; i < NBUCKETS; i++) {
+    struct bucket *curr_bucket = &bcache_buckets[i];
+    if(i != bucket_idx) {
+      acquire(&curr_bucket->lock);
+    }
+    
+    for(b = curr_bucket->head.next; b != &curr_bucket->head; b = b->next) {
+      if(b->refcnt == 0) {
+        best_buf = b;
+        best_bucket = curr_bucket;
+        best_bucket_idx = i;
+        break;
+      }
+    }
+    
+    if(best_buf) {
+      break;  // 找到了可用缓冲区，可以停止搜索
+    }
+    
+    if(i != bucket_idx) {
+      release(&curr_bucket->lock);
+    }
+  }
+  
+  if(best_buf == 0) {
+    // 没有找到可用的缓冲区
+    if(bucket_idx != best_bucket_idx) {
+      release(&bucket->lock);
+    }
+    release(&bcache.lock);
+    panic("bget: no buffers");
+  }
+  
+  // 找到了可用的缓冲区
+  if(best_bucket_idx != bucket_idx) {
+    // 从旧桶中移除缓冲区
+    best_buf->next->prev = best_buf->prev;
+    best_buf->prev->next = best_buf->next;
+    
+    // 添加到新桶中
+    best_buf->next = bucket->head.next;
+    best_buf->prev = &bucket->head;
+    bucket->head.next->prev = best_buf;
+    bucket->head.next = best_buf;
+    
+    // 释放旧桶的锁
+    release(&best_bucket->lock);
+  }
+  
+  // 设置缓冲区信息
+  best_buf->dev = dev;
+  best_buf->blockno = blockno;
+  best_buf->valid = 0;
+  best_buf->refcnt = 1;
+  
+  release(&bucket->lock);
+  release(&bcache.lock);
+  
+  acquiresleep(&best_buf->lock);
+  return best_buf;
+}
+
+// Release a locked buffer.
+void
+brelse(struct buf *b)
+{
+  if(!holdingsleep(&b->lock))
+    panic("brelse");
+
+  releasesleep(&b->lock);
+
+  uint bucket_idx = hash(b->dev, b->blockno);
+  struct bucket *bucket = &bcache_buckets[bucket_idx];
+  
+  acquire(&bucket->lock);
+  b->refcnt--;
+  release(&bucket->lock);
+}
+
+void
+bpin(struct buf *b) {
+  uint bucket_idx = hash(b->dev, b->blockno);
+  struct bucket *bucket = &bcache_buckets[bucket_idx];
+  
+  acquire(&bucket->lock);
+  b->refcnt++;
+  release(&bucket->lock);
+}
+
+void
+bunpin(struct buf *b) {
+  uint bucket_idx = hash(b->dev, b->blockno);
+  struct bucket *bucket = &bcache_buckets[bucket_idx];
+  
+  acquire(&bucket->lock);
+  b->refcnt--;
+  release(&bucket->lock);
 }
 
 // Return a locked buf with the contents of the indicated block.
@@ -110,44 +241,4 @@ bwrite(struct buf *b)
     panic("bwrite");
   virtio_disk_rw(b, 1);
 }
-
-// Release a locked buffer.
-// Move to the head of the most-recently-used list.
-void
-brelse(struct buf *b)
-{
-  if(!holdingsleep(&b->lock))
-    panic("brelse");
-
-  releasesleep(&b->lock);
-
-  acquire(&bcache.lock);
-  b->refcnt--;
-  if (b->refcnt == 0) {
-    // no one is waiting for it.
-    b->next->prev = b->prev;
-    b->prev->next = b->next;
-    b->next = bcache.head.next;
-    b->prev = &bcache.head;
-    bcache.head.next->prev = b;
-    bcache.head.next = b;
-  }
-  
-  release(&bcache.lock);
-}
-
-void
-bpin(struct buf *b) {
-  acquire(&bcache.lock);
-  b->refcnt++;
-  release(&bcache.lock);
-}
-
-void
-bunpin(struct buf *b) {
-  acquire(&bcache.lock);
-  b->refcnt--;
-  release(&bcache.lock);
-}
-
 
