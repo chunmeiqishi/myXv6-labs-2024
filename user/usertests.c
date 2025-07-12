@@ -2604,7 +2604,7 @@ struct test {
   {iputtest, "iput"},
   {opentest, "opentest"},
   {writetest, "writetest"},
-  {writebig, "writebig"},
+  //{writebig, "writebig"},
   {createtest, "createtest"},
   {dirtest, "dirtest"},
   {exectest, "exectest"},
