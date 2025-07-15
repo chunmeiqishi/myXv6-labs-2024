@@ -67,6 +67,15 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
+#ifdef LAB_MMAP
+  } else if(r_scause() == 13 || r_scause() == 15) {
+    // page fault - load page fault (13) or store page fault (15)
+    uint64 va = r_stval();
+    if(mmap_handler(va) < 0) {
+      printf("usertrap(): page fault va=0x%lx pid=%d\n", va, p->pid);
+      setkilled(p);
+    }
+#endif
   } else {
     printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
     printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());

@@ -5,6 +5,12 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#ifdef LAB_MMAP
+#include "sleeplock.h"
+#include "fs.h"
+#include "file.h"
+#include "fcntl.h"
+#endif
 
 struct cpu cpus[NCPU];
 
@@ -145,6 +151,13 @@ found:
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
+
+#ifdef LAB_MMAP
+  // Initialize VMAs
+  for(int i = 0; i < NVMA; i++) {
+    p->vmas[i].used = 0;
+  }
+#endif
 
   return p;
 }
@@ -310,6 +323,16 @@ fork(void)
 
   safestrcpy(np->name, p->name, sizeof(p->name));
 
+#ifdef LAB_MMAP
+  // Copy VMA mappings
+  for(i = 0; i < NVMA; i++) {
+    if(p->vmas[i].used) {
+      np->vmas[i] = p->vmas[i];
+      filedup(np->vmas[i].f); // Increment file reference count
+    }
+  }
+#endif
+
   pid = np->pid;
 
   release(&np->lock);
@@ -364,6 +387,46 @@ exit(int status)
   iput(p->cwd);
   end_op();
   p->cwd = 0;
+
+#ifdef LAB_MMAP
+  // Clean up mmap regions
+  for(int i = 0; i < NVMA; i++) {
+    if(p->vmas[i].used) {
+      // Unmap and write back if needed (similar to munmap)
+      struct vma *vma = &p->vmas[i];
+      for(uint64 va = vma->addr; va < vma->addr + vma->len; va += PGSIZE) {
+        pte_t *pte = walk(p->pagetable, va, 0);
+        if(pte && (*pte & PTE_V)) {
+          // If it's a shared mapping, write it back
+          if(vma->flags & MAP_SHARED) {
+            uint64 pa = PTE2PA(*pte);
+            int off = vma->offset + (va - vma->addr);
+            begin_op();
+            ilock(vma->f->ip);
+            // Don't extend the file beyond its original size
+            int write_size = PGSIZE;
+            if(off + PGSIZE > vma->f->ip->size) {
+              if(off >= vma->f->ip->size) {
+                write_size = 0;
+              } else {
+                write_size = vma->f->ip->size - off;
+              }
+            }
+            if(write_size > 0) {
+              writei(vma->f->ip, 0, pa, off, write_size);
+            }
+            iunlock(vma->f->ip);
+            end_op();
+          }
+          // Unmap the single page
+          uvmunmap(p->pagetable, va, 1, 1);
+        }
+      }
+      fileclose(vma->f);
+      vma->used = 0;
+    }
+  }
+#endif
 
   acquire(&wait_lock);
 
