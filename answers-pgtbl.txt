@@ -1,0 +1,23 @@
+Part 1: Analyzing Other System Calls That Can Be Optimized Using the Shared Page
+1. getppid() System Call
+The getppid() system call is used to retrieve the process ID of the parent process. Similar to getpid(), the parent process ID is a static value for a given process during its lifetime (except in some special cases like orphan processes, but the basic concept remains valid).
+
+We can follow the same approach as for getpid(). When a new process is created, in addition to storing the current process ID in the struct usyscall at the start of the read - only page mapped at USYSCALL, we can also store the parent process ID.
+
+The ugetppid() function on the user - space side can then directly access this value from the shared page without having to cross into the kernel. This eliminates the overhead associated with the context switch and the kernel entry/exit operations, thereby speeding up the system call.
+
+2. getuid() and geteuid() System Calls
+The getuid() system call returns the real user ID of the calling process, and geteuid() returns the effective user ID. These values are set when the process is created and typically remain constant throughout the process’s execution.
+
+We can extend the struct usyscall to include fields for the real and effective user IDs. When a new process is created, the kernel initializes these fields with the appropriate user ID values.
+
+On the user - space side, functions like ugetuid() and ugeteuid() can access these values directly from the shared read - only page. This avoids the need for a kernel crossing, reducing the time taken to execute these system calls.
+
+Part 2: General Explanation of the Optimization
+The key to optimizing these system calls using the shared page is that they return values that are relatively static and can be determined at process creation time.
+
+By mapping a read - only page shared between the user - space and the kernel, and storing these static values in a well - defined structure (struct usyscall), we can bypass the normal kernel crossing mechanism.
+
+Normally, when a system call is made, the CPU has to switch from user mode to kernel mode, which involves saving the user - space context, executing the kernel code for the system call, and then restoring the user - space context. This process has significant overhead.
+
+With the shared page optimization, the user - space code can directly read the required values from the shared page, eliminating the need for this context switch and the associated overhead, thus speeding up the system call execution.

@@ -23,10 +23,32 @@ struct {
   struct run *freelist;
 } kmem;
 
+#ifdef LAB_PGTBL
+// Super page allocator for 2MB pages
+struct {
+  struct spinlock lock;
+  struct run *freelist;
+} superkmem;
+
+// Fixed super page pool (allocate 4 superpages)
+char superpage_pool[4 * SUPERPGSIZE] __attribute__((aligned(SUPERPGSIZE)));
+#endif
+
 void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
+#ifdef LAB_PGTBL
+  initlock(&superkmem.lock, "superkmem");
+  
+  // Initialize super page allocator with fixed pool
+  superkmem.freelist = 0;
+  for(int i = 0; i < 4; i++) {
+    struct run *r = (struct run*)(superpage_pool + i * SUPERPGSIZE);
+    r->next = superkmem.freelist;
+    superkmem.freelist = r;
+  }
+#endif
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -80,3 +102,44 @@ kalloc(void)
     memset((char*)r, 5, PGSIZE); // fill with junk
   return (void*)r;
 }
+
+#ifdef LAB_PGTBL
+// Allocate one 2MB superpage of physical memory.
+// Returns a pointer that the kernel can use.
+// Returns 0 if the memory cannot be allocated.
+void *
+superalloc(void)
+{
+  struct run *r;
+
+  acquire(&superkmem.lock);
+  r = superkmem.freelist;
+  if(r)
+    superkmem.freelist = r->next;
+  release(&superkmem.lock);
+
+  if(r)
+    memset((char*)r, 5, SUPERPGSIZE); // fill with junk
+  return (void*)r;
+}
+
+// Free the 2MB superpage of physical memory pointed at by pa.
+void
+superfree(void *pa)
+{
+  struct run *r;
+
+  if(((uint64)pa % SUPERPGSIZE) != 0)
+    panic("superfree: not aligned");
+
+  // Fill with junk to catch dangling refs.
+  memset(pa, 1, SUPERPGSIZE);
+
+  r = (struct run*)pa;
+
+  acquire(&superkmem.lock);
+  r->next = superkmem.freelist;
+  superkmem.freelist = r;
+  release(&superkmem.lock);
+}
+#endif

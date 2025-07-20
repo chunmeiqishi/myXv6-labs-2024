@@ -187,6 +187,65 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
   return 0;
 }
 
+#ifdef LAB_PGTBL
+// Create PTEs for superpages mapping virtual addresses starting at va
+// to physical addresses starting at pa. va and size MUST be superpage-aligned.
+// Returns 0 on success, -1 on failure.
+int
+mappages_super(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
+{
+  uint64 a, last;
+
+  if((va % SUPERPGSIZE) != 0)
+    panic("mappages_super: va not aligned");
+
+  if((size % SUPERPGSIZE) != 0)
+    panic("mappages_super: size not aligned");
+
+  if(size == 0)
+    panic("mappages_super: size");
+
+  a = va;
+  last = va + size - SUPERPGSIZE;
+  for(;;){
+    // Walk to level-1 page table manually for superpages
+    // Level 2 (top level)
+    pte_t *pte2 = &pagetable[PX(2, a)];
+    pagetable_t level1;
+    if(!(*pte2 & PTE_V)) {
+      // Need to allocate level-1 page table
+      level1 = (pagetable_t)kalloc();
+      if(level1 == 0)
+        return -1;
+      memset(level1, 0, PGSIZE);
+      *pte2 = PA2PTE((uint64)level1) | PTE_V;
+    } else {
+      // Level-1 page table already exists
+      level1 = (pagetable_t)PTE2PA(*pte2);
+    }
+    
+    // Level 1 - this is where we place the superpage PTE
+    uint64 px1 = PX(1, a);
+    if(px1 >= PGSIZE/sizeof(pte_t)) {
+      panic("mappages_super: px1 out of range");
+    }
+    pte_t *pte1 = &level1[px1];
+    
+    if(*pte1 & PTE_V)
+      panic("mappages_super: remap");
+      
+    // Create superpage entry: must include read/write permissions to make it a leaf
+    *pte1 = PA2PTE(pa) | perm | PTE_V;
+    
+    if(a == last)
+      break;
+    a += SUPERPGSIZE;
+    pa += SUPERPGSIZE;
+  }
+  return 0;
+}
+#endif
+
 // Remove npages of mappings starting from va. va must be
 // page-aligned. The mappings must exist.
 // Optionally free the physical memory.
@@ -202,6 +261,31 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
 
   for(a = va; a < va + npages*PGSIZE; a += sz){
     sz = PGSIZE;
+    
+#ifdef LAB_PGTBL_DISABLED_FOR_NOW
+    // Check if this might be a superpage
+    if((a % SUPERPGSIZE) == 0 && a + SUPERPGSIZE <= va + npages*PGSIZE) {
+      // Check if we have a superpage mapping at level 1
+      pte_t *pte2 = walk(pagetable, a, 0);
+      if(pte2 != 0 && (*pte2 & PTE_V)) {
+        uint64 *pgtbl = (uint64 *)PTE2PA(*pte2);
+        uint64 index1 = (a >> 21) & 0x1FF;
+        pte_t *pte1 = &pgtbl[index1];
+        
+        if((*pte1 & PTE_V) && (PTE_FLAGS(*pte1) != PTE_V)) {
+          // This is a superpage
+          sz = SUPERPGSIZE;
+          if(do_free){
+            uint64 pa = PTE2PA(*pte1);
+            superfree((void*)pa);
+          }
+          *pte1 = 0;
+          continue;
+        }
+      }
+    }
+#endif
+    
     if((pte = walk(pagetable, a, 0)) == 0)
       panic("uvmunmap: walk");
     if((*pte & PTE_V) == 0) {
@@ -263,6 +347,37 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
   oldsz = PGROUNDUP(oldsz);
   for(a = oldsz; a < newsz; a += sz){
     sz = PGSIZE;
+    
+#ifdef LAB_PGTBL
+    // Check if we can use a superpage (2MB)
+    // Conditions: 
+    // 1. Virtual address is 2MB aligned
+    // 2. At least 2MB of space remaining
+    // 3. Range doesn't cross 2MB boundaries
+    uint64 superstart = (a + SUPERPGSIZE - 1) & ~(SUPERPGSIZE - 1);
+    if(superstart == a && a + SUPERPGSIZE <= newsz && 
+       (a & (SUPERPGSIZE - 1)) == 0) {
+      // Try to allocate a superpage
+      mem = superalloc();
+      if(mem != 0) {
+        sz = SUPERPGSIZE;
+#ifndef LAB_SYSCALL
+        memset(mem, 0, sz);
+#endif
+        // Map the superpage as a level-1 PTE
+        if(mappages_super(pagetable, a, sz, (uint64)mem, PTE_R|PTE_U|xperm) != 0){
+          superfree(mem);
+          uvmdealloc(pagetable, a, oldsz);
+          return 0;
+        }
+        // Flush TLB after creating superpage mapping
+        sfence_vma();
+        continue;
+      }
+      // Fall back to regular pages if superpage allocation fails
+    }
+#endif
+    
     mem = kalloc();
     if(mem == 0){
       uvmdealloc(pagetable, a, oldsz);
@@ -345,7 +460,36 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 
   for(i = 0; i < sz; i += szinc){
     szinc = PGSIZE;
-    szinc = PGSIZE;
+    
+#ifdef LAB_PGTBL
+    // Check if this might be a superpage
+    if((i % SUPERPGSIZE) == 0 && i + SUPERPGSIZE <= sz) {
+      // Check if we have a superpage mapping at level 1
+      pte_t *pte2 = walk(old, i, 0);
+      if(pte2 != 0 && (*pte2 & PTE_V)) {
+        uint64 *pgtbl = (uint64 *)PTE2PA(*pte2);
+        uint64 index1 = (i >> 21) & 0x1FF;
+        pte_t *pte1 = &pgtbl[index1];
+        
+        if((*pte1 & PTE_V) && (PTE_FLAGS(*pte1) != PTE_V)) {
+          // This is a superpage
+          szinc = SUPERPGSIZE;
+          pa = PTE2PA(*pte1);
+          flags = PTE_FLAGS(*pte1);
+          
+          if((mem = superalloc()) == 0)
+            goto err;
+          memmove(mem, (char*)pa, SUPERPGSIZE);
+          if(mappages_super(new, i, SUPERPGSIZE, (uint64)mem, flags) != 0){
+            superfree(mem);
+            goto err;
+          }
+          continue;
+        }
+      }
+    }
+#endif
+    
     if((pte = walk(old, i, 0)) == 0)
       panic("uvmcopy: pte should exist");
     if((*pte & PTE_V) == 0)
