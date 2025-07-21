@@ -1,0 +1,7 @@
+Q:Looking at the backtrace output, which function called syscall?
+A: file kernel/syscall.c, line 243.   function :sys_unlink
+
+Q:What is the value of p->trapframe->a7 and what does that value represent? (Hint: look user/initcode.S, the first user program xv6 starts.)
+
+Q：What was the previous mode that the CPU was in?
+A：kernel
